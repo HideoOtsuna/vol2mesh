@@ -7,12 +7,9 @@ import functools
 import subprocess
 from io import BytesIO
 from itertools import chain
-from contextlib import contextmanager
 
 import numpy as np
 import lz4.frame
-from scipy.ndimage import find_objects
-import pyfqmr
 from vol2mesh.util import compute_nonzero_box, extract_subvol, has_nonzero_edges
 
 try:
@@ -24,7 +21,7 @@ except ImportError:
 from .normals import compute_face_normals, compute_vertex_normals
 from .obj_utils import write_obj, read_obj
 from .ngmesh import read_ngmesh, write_ngmesh
-from .io_utils import stdout_redirected
+from .io_utils import TemporaryNamedPipe, AutoDeleteDir, stdout_redirected
 
 logger = logging.getLogger(__name__)
 
@@ -247,109 +244,48 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, method='ilastik', ensure_halo=False, **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, voxel_size_zyx=(1,1,1), method='ilastik', ensure_halo=False, **kwargs):
         """
-        Alternate constructor.
-        Run marching cubes on the given volume and return a Mesh object.
-
-        Args:
-            downsampled_volume_zyx:
-                A binary volume, possibly at a downsampled resolution.
-            fullres_box_zyx:
-                The bounding-box inhabited by the given volume, in FULL-res coordinates.
-            method:
-                Which library to use for marching_cubes. Choices are:
-                - "ilastik" -- Use github.com/ilastik/marching_cubes
-                - "skimage" -- Use scikit-image marching_cubes_lewiner
-                  (Not a required dependency.  Install ``scikit-image`` to use this method.)
-            ensure_halo:
-                If True, pad the volume to ensure that the object is surrounded by a 1-px empty plane on all sides.
-            kwargs:
-                Any extra arguments to the particular marching cubes implementation.
-                The 'ilastik' method supports initial smoothing via a ``smoothing_rounds`` parameter.
-
-        Returns:
-            Mesh
-
-        Note:
-            No surface is added for the volume boundaries, so objects which
-            touch the edge of the volume will be "open" at the edge.
-            If you want to see an edge there, pad your volume with a 1-px
-            halo on all sides (and adjust fullres_box_zyx accordingly).
+        Generate a mesh from a binary volume.
         """
         assert downsampled_volume_zyx.ndim == 3
-
+    
         if fullres_box_zyx is None:
-            fullres_box_zyx = np.array([(0,0,0), downsampled_volume_zyx.shape])
+            fullres_box_zyx = np.array([(0, 0, 0), np.array(downsampled_volume_zyx.shape) * voxel_size_zyx])
         else:
             fullres_box_zyx = np.asarray(fullres_box_zyx)
-
-        # Infer the resolution of the downsampled volume
-        resolution = (fullres_box_zyx[1] - fullres_box_zyx[0]) // downsampled_volume_zyx.shape
-
-        if ensure_halo and has_nonzero_edges(downsampled_volume_zyx):
-            downsampled_volume_zyx = np.pad(downsampled_volume_zyx, 1)
-            fullres_box_zyx += resolution * np.array([[-1, -1, -1], [1, 1, 1]])
-        elif downsampled_volume_zyx.all() or not downsampled_volume_zyx.any():
-            # Completely full (or empty) boxes are not meshable -- they would be
-            # open on all sides, leaving no vertices or faces.
-            # Just return an empty mesh.
-            empty_vertices = np.zeros((0, 3), dtype=np.float32)
-            empty_faces = np.zeros((0, 3), dtype=np.uint32)
-            return Mesh(empty_vertices, empty_faces, box=fullres_box_zyx)
-
+    
+        # Generate the mesh
         try:
-            assert method in ('skimage' 'ilastik'), f"Unknown method: {method}"
+            assert method in ('skimage', 'ilastik'), f"Unknown method: {method}"
             if method == 'skimage':
                 from skimage.measure import marching_cubes
-                padding = np.array([0,0,0])
-
-                # Tiny volumes trigger a corner case in skimage, so we pad them with zeros.
-                # This results in faces on all sides of the volume,
-                # but it's not clear what else to do.
-                if (np.array(downsampled_volume_zyx.shape) <= 2).any():
-                    padding = np.array([2,2,2], dtype=int) - downsampled_volume_zyx.shape
-                    padding = np.maximum([0,0,0], padding)
-                    downsampled_volume_zyx = np.pad( downsampled_volume_zyx, tuple(zip(padding, padding)), 'constant' )
-
-                kws = {'step_size': 1}
-                kws.update(kwargs)
-                vertices_zyx, faces, normals_zyx, _values = marching_cubes(downsampled_volume_zyx, 0.5, **kws)
-
-                # Skimage assumes that the coordinate origin is CENTERED inside pixel (0,0,0),
-                # whereas we assume that the origin is the UPPER-LEFT corner of pixel (0,0,0).
-                # Therefore, shift the results by a half-pixel.
-                vertices_zyx += 0.5
-
-                if padding.any():
-                    vertices_zyx -= padding
+                vertices_zyx, faces, normals_zyx, _ = marching_cubes(downsampled_volume_zyx, 0.5)
+                vertices_zyx += 0.5  # Shift due to skimage assumption
             elif method == 'ilastik':
                 from marching_cubes import march
-                try:
-                    smoothing_rounds = kwargs['smoothing_rounds']
-                except KeyError:
-                    smoothing_rounds = 0
-
-                # ilastik's marching_cubes expects FORTRAN order
-                if downsampled_volume_zyx.flags['F_CONTIGUOUS']:
-                    vertices_zyx, normals_zyx, faces = march(downsampled_volume_zyx, smoothing_rounds)
-                else:
-                    downsampled_volume_zyx = np.asarray(downsampled_volume_zyx, order='C')
-                    vertices_xyz, normals_xyz, faces = march(downsampled_volume_zyx.transpose(), smoothing_rounds)
-                    vertices_zyx = vertices_xyz[:, ::-1]
-                    normals_zyx = normals_xyz[:, ::-1]
-                    faces[:] = faces[:, ::-1]
-
+                vertices_xyz, normals_xyz, faces = march(downsampled_volume_zyx, kwargs.get('smoothing_rounds', 0))
+                vertices_zyx = vertices_xyz[:, ::-1]
+                normals_zyx = normals_xyz[:, ::-1]
+                faces[:] = faces[:, ::-1]
                 vertices_zyx += 0.5
         except ValueError as ex:
             logger.error(f"Error during mesh generation: {ex}")
             raise
-
-        # Upscale and translate the mesh into place
-        vertices_zyx[:] *= resolution
-        vertices_zyx[:] += fullres_box_zyx[0]
-
+    
+        # ✅ **Fix: Only scale by voxel size, NOT the full bounding box**
+        vertices_zyx *= voxel_size_zyx  # Correct scaling
+        vertices_zyx += fullres_box_zyx[0]
+    
+        # Debugging prints
+        print(f"Fullres Box: {fullres_box_zyx}", flush=True)
+        print(f"Voxel Size ZYX: {voxel_size_zyx}", flush=True)
+        print(f"After Scaling - Min: {vertices_zyx.min(axis=0)}, Max: {vertices_zyx.max(axis=0)}", flush=True)
+        print(f"After Translation - Min: {vertices_zyx.min(axis=0)}, Max: {vertices_zyx.max(axis=0)}", flush=True)
+    
         return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx)
+
+
 
 
     @classmethod
@@ -386,7 +322,7 @@ class Mesh:
             dict of ``{label: Mesh}``
         """
         if fullres_box_zyx is None:
-            fullres_box_zyx = np.array([[0, 0, 0], downsampled_volume_zyx.shape])
+            fullres_box_zyx = np.array([[0,0,0], downsampled_volume_zyx.shape])
         fullres_shape = fullres_box_zyx[1] - fullres_box_zyx[0]
         resolution = fullres_shape // downsampled_volume_zyx.shape
 
@@ -417,20 +353,21 @@ class Mesh:
             except ImportError:
                 pass
 
-        boxes = cls._label_boxes(downsampled_volume_zyx, labels)
-
         meshes = {}
         for label in labels:
-            try:
-                subvol_box = boxes[label]
-            except KeyError:
+            mask = (downsampled_volume_zyx == label)
+
+            # Save time by extracting the smallest
+            # bounding box possible for the object.
+            subvol_box = compute_nonzero_box(mask)
+            if not subvol_box.any():
                 meshes[label] = None
                 continue
 
             subvol_box[0] = np.maximum(0, subvol_box[0] - 1)
-            subvol_box[1] = np.minimum(downsampled_volume_zyx.shape, subvol_box[1] + 1)
+            subvol_box[1] = np.minimum(mask.shape, subvol_box[1] + 1)
 
-            subvol_mask = (extract_subvol(downsampled_volume_zyx, subvol_box) == label)
+            subvol_mask = extract_subvol(mask, subvol_box)
             mesh = cls.from_binary_vol(subvol_mask, subvol_box, method, **kwargs)
 
             # Upscale and translate the mesh into place
@@ -439,34 +376,6 @@ class Mesh:
             meshes[label] = mesh
 
         return meshes
-
-    @classmethod
-    def _label_boxes(cls, vol, labels):
-        """
-        Find the bounding box of each object of interest in vol,
-        as specified in the given list of label ids.
-        """
-        boxes = {}
-        if max(labels) <= 1e6:
-            # Use scipy to get a list of all objects.
-            vol[vol > max(labels)] = 0
-            slices = find_objects(vol)
-            for label, sl in enumerate(slices, start=1):
-                if not sl:
-                    continue
-                tuples = [(s.start, s.stop) for s in sl]
-                box = np.array(tuples).transpose()
-                boxes[label] = box
-        else:
-            # Slow path
-            for label in labels:
-                mask = (vol == label)
-                subvol_box = compute_nonzero_box(mask)
-                if not subvol_box.any():
-                    continue
-                boxes[label] = subvol_box
-
-        return boxes
 
 
     @classmethod
@@ -786,34 +695,88 @@ class Mesh:
         else:
             self.normals_zyx = compute_vertex_normals(self.vertices_zyx, self.faces, face_normals=face_normals)
 
-    def simplify(self, fraction):
-        if fraction is None or fraction == 1.0:
+
+    def simplify(self, fraction, in_memory=False, timeout=None, hide_logging=True):
+        """
+        Simplify this mesh in-place, by the given fraction (of the original vertex count).
+
+        Args:
+            fraction:
+                Reduce the overall vertex count so that only a fraction of
+                them remain, as specified by this argument.
+            in_memory:
+                Interact with the decimation subprocess via a pipe, rather than a file
+                At the time of this writing, this feature no longer works.
+            timeout:
+                Raise a TimeoutError if the decimation routine takes
+                longer than the given number of seconds.
+                By default, no timeout is enforced (it can hang forever).
+            hide_logging:
+                The subprocess which performs the decimation is quite noisy.
+                We hide its output by default, but you can see it with this argument.
+        Returns:
+            None. This method operates on the mesh in-place.
+        """
+        # The fq-mesh-simplify tool rejects inputs that are too small (if the decimated face count would be less than 4).
+        # We have to check for this in advance because we can't gracefully handle the error.
+        # https://github.com/neurolabusc/Fast-Quadric-Mesh-Simplification-Pascal-/blob/master/c_code/Main.cpp
+        if fraction is None or fraction == 1.0 or (len(self.faces) * fraction <= 4):
+            if self.normals_zyx.shape[0] == 0:
+                self.recompute_normals(True)
             return
 
-        simplifier = pyfqmr.Simplify()
-        simplifier.setMesh(self.vertices_zyx, self.faces)
-        target_face_count = int(fraction * len(self.faces))
-        simplifier.simplify_mesh(
-            target_face_count,
-            aggressiveness=7,
-            preserve_border=True,
-            lossless=False
-        )
+        stdout = subprocess.DEVNULL if hide_logging else None
 
-        vertices_zyx, faces, _face_normals = simplifier.getMesh()
-        self.vertices_zyx = vertices_zyx.astype(np.float32)
-        self.faces = faces.astype(np.int32)
+        if in_memory:
+            obj_bytes = write_obj(self.vertices_zyx[:,::-1], self.faces)
+            bytes_stream = BytesIO(obj_bytes)
+
+            simplify_input_pipe = TemporaryNamedPipe('input.obj')
+            simplify_input_pipe.start_writing_stream(bytes_stream)
+
+            simplify_output_pipe = TemporaryNamedPipe('output.obj')
+
+            cmd = f'fq-mesh-simplify {simplify_input_pipe.path} {simplify_output_pipe.path} {fraction}'
+            proc = subprocess.Popen(cmd, shell=True, stdout=stdout)
+            mesh_stream = simplify_output_pipe.open_stream('rb')
+
+            # The fq-mesh-simplify tool does not compute normals.
+            vertices_xyz, self.faces, _empty_normals = read_obj(mesh_stream)
+            self.vertices_zyx = vertices_xyz[:,::-1]
+            mesh_stream.close()
+
+            proc.wait(timeout=1.0)
+            if proc.returncode != 0:
+                msg = f"Child process returned an error code: {proc.returncode}.\n"\
+                      f"Command was: {cmd}"
+                logger.error(msg)
+                raise RuntimeError(msg)
+        else:
+            obj_dir = AutoDeleteDir()
+            undecimated_path = f'{obj_dir}/undecimated.obj'
+            decimated_path = f'{obj_dir}/decimated.obj'
+            write_obj(self.vertices_zyx[:,::-1], self.faces, output_file=undecimated_path)
+            cmd = f'fq-mesh-simplify {undecimated_path} {decimated_path} {fraction}'
+            subprocess.check_call(cmd, shell=True, timeout=timeout, stdout=stdout)
+            with open(decimated_path, 'rb') as decimated_stream:
+                # The fq-mesh-simplify tool does not compute normals.
+                vertices_xyz, self.faces, _empty_normals = read_obj(decimated_stream)
+                self.vertices_zyx = vertices_xyz[:,::-1]
 
         # Force normal reomputation to eliminate possible degenerate faces
         # (Can decimation produce degenerate faces?)
         self.recompute_normals(True)
 
+
     def simplify_openmesh(self, fraction):
         """
-        Deprecated.  The pyfqmr-based simplify() method is gives better results and is more stable.
-
         Simplify this mesh in-place, by the given fraction (of the original vertex count).
         Uses OpenMesh to perform the decimation.
+        This has similar performance to our default simplify() method,
+        but does not require a subprocess or conversion to OBJ.
+        Therefore, it can be faster in cases where I/O is the major bottleneck,
+        rather than the decimation procedure itself.
+        (For example, when lightly decimating a large mesh, I/O is the bottleneck.)
         """
         if len(self.vertices_zyx) == 0:
             return
@@ -824,36 +787,31 @@ class Mesh:
                 self.recompute_normals(True)
             return
 
-        logger.debug(f"Attempting to decimate to {target} (Reduce by {len(self.vertices_zyx) - target})")
-
         import openmesh as om
-
-        @contextmanager
-        def dummy_context(*args, **kwargs):
-            yield
 
         # Mesh construction in OpenMesh produces a lot of noise on stderr.
         # Send it to /dev/null
         try:
             sys.stderr.fileno()
-        except Exception:
+        except:
             # Can't redirect stderr if it has no file descriptor.
             # Just let the output spill to wherever it's going.
-            _stdout_redirected = dummy_context
-        else:
-            _stdout_redirected = stdout_redirected
-
-        with _stdout_redirected(stdout=sys.stderr):
             m = om.TriMesh(self.vertices_zyx[:, ::-1], self.faces)
-            h = om.TriMeshModQuadricHandle()
-            d = om.TriMeshDecimater(m)
-            d.add(h)
-            d.module(h).unset_max_err()
-            d.initialize()
-            eliminated_count = d.decimate_to(target)
-            m.garbage_collection()
+        else:
+            # Hide stderr, since OpenMesh construction is super noisy.
+            with stdout_redirected(stdout=sys.stderr):
+                m = om.TriMesh(self.vertices_zyx[:, ::-1], self.faces)
 
+        h = om.TriMeshModQuadricHandle()
+        d = om.TriMeshDecimater(m)
+        d.add(h)
+        d.module(h).unset_max_err()
+        d.initialize()
+
+        logger.debug(f"Attempting to decimate to {target} (Reduce by {len(self.vertices_zyx) - target})")
+        eliminated_count = d.decimate_to(target)
         logger.debug(f"Reduced by {eliminated_count}")
+        m.garbage_collection()
 
         self.vertices_zyx = m.points()[:, ::-1].astype(np.float32)
         self.faces = m.face_vertex_indices().astype(np.uint32)
